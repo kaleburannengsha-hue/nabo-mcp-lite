@@ -1,0 +1,30 @@
+{
+  "name": "nabo-mcp-lite",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A lightweight MCP-to-Chrome bridge derived from Nanobrowser",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kaleburannengsha-hue/nabo-mcp-lite.git"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "test": "vitest run",
+    "type-check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "puppeteer-core": "24.31.0",
+    "webextension-polyfill": "^0.12.0",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.330",
+    "@types/node": "^22.5.5",
+    "@types/ws": "^8.5.13",
+    "typescript": "5.5.4",
+    "vite": "^5.4.21",
+    "vitest": "2.1.9"
+  }
+}

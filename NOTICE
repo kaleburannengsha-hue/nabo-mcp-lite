@@ -1,0 +1,7 @@
+Nabo MCP Lite
+
+This project contains code derived from Nanobrowser:
+https://github.com/nanobrowser/nanobrowser
+
+Nanobrowser is distributed under the Apache License, Version 2.0.
+The browser automation layer was reduced and adapted for local MCP communication.

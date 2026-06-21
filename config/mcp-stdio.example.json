@@ -1,0 +1,11 @@
+{
+  "name": "nanobrowser",
+  "transport": "stdio",
+  "command": "node",
+  "args": [
+    "/absolute/path/to/nabo-mcp-lite/server/single-session-server.cjs"
+  ],
+  "env": {
+    "MCP_WS_PORT": "9876"
+  }
+}

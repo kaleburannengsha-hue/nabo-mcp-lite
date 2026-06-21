@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "nanobrowser": {
+      "command": "node",
+      "args": [
+        "D:\\path\\to\\nabo-mcp-lite\\server\\single-session-server.cjs"
+      ]
+    }
+  }
+}
