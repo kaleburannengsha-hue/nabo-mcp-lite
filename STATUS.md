@@ -56,3 +56,54 @@ node scripts/runtime-test.cjs
 3. 9876 端口没有被另一个 MCP 服务占用。
 
 完整操作见 [OPERATIONS.md](OPERATIONS.md)。
+
+## 2026-07-19 CDP execute_script 改造记录
+
+背景：考试页在整卷模式下 DOM 已渲染 80 个 `.question_box`，Codex/DevTools 类自动化能直接读到；旧 `execute_script` 使用 `chrome.scripting.executeScript + new Function(code)`，会被目标站点 CSP 拦截，典型错误为 `unsafe-eval` / `Refused to execute inline script`。
+
+已改造：
+
+- `extension/src/tools.ts`
+  - `execute_script` 改为 `chrome.debugger` + CDP `Runtime.evaluate`。
+  - 使用 `Page.getFrameTree` + `Page.createIsolatedWorld` 创建页面执行上下文。
+  - 返回 `{ result, mode: "cdp" }`，用于确认不是旧注入路径。
+  - 针对同一个 tab 缓存 CDP attachment 和 `executionContextId`，避免连续调用时上下文漂移。
+  - 遇到 `Another debugger is already attached` 时尝试复用已有 debugger session。
+
+验证过的现象：
+
+- 构建后未重新加载扩展时，实际 MCP 调用仍会报 CSP `unsafe-eval`，说明 Chrome 仍运行旧后台。
+- 重新加载扩展后，`execute_script` 调用 `1 + 1` 返回 `{ "result": 2, "mode": "cdp" }`，说明 CDP 路径已生效。
+- 考试页曾验证 `typeof document` 返回 `{ "result": "object", "mode": "cdp" }`。
+- 在最后一次缓存修复前，连续调用 `document.querySelectorAll('.question_box').length` 仍出现过间歇性 `document is not defined`；当前修复方向是复用同一 tab 的 CDP execution context。
+
+最新自动验证命令：
+
+```powershell
+pnpm.cmd test
+pnpm.cmd type-check
+pnpm.cmd build
+```
+
+最近一次结果：
+
+- `pnpm.cmd test`：20 tests passed。
+- `pnpm.cmd type-check`：passed。
+- `pnpm.cmd build`：passed，仍有 Vite 对 `chromium-bidi` 的 `crypto` browser compatibility warning，但退出码为 0。
+
+后续如果考试页还能打开，手动重新加载扩展后，优先运行下面的实际验证：
+
+```js
+1 + 1
+typeof document
+document.querySelectorAll('.question_box').length
+document.querySelectorAll('.question_box')[17]?.innerText.slice(0,120)
+document.querySelectorAll('.question_box')[79]?.innerText.slice(0,120)
+```
+
+目标结果：
+
+- `1 + 1` 返回 `2` 且 `mode` 为 `cdp`。
+- `typeof document` 返回 `object`。
+- `.question_box` 数量应返回 `80`。
+- 第 18 题、第 80 题应能返回文本片段。

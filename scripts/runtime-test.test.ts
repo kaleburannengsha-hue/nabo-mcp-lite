@@ -29,4 +29,13 @@ describe('runtime-test configuration', () => {
     expect(source).toContain('async function waitForExtension');
     expect(source).toContain("err.message.includes('Extension not connected')");
   });
+
+  it('verifies execute_script uses the CDP path at runtime', () => {
+    const source = readFileSync(runtimeTestPath, 'utf8');
+
+    expect(source).toContain("name: 'execute_script'");
+    expect(source).toContain("code: '1 + 1'");
+    expect(source).toContain("scriptResult.mode !== 'cdp'");
+    expect(source).toContain('EXECUTE_SCRIPT_OK');
+  });
 });

@@ -45,6 +45,26 @@ const mockChrome = {
   scripting: {
     executeScript: vi.fn().mockResolvedValue([{ result: 'ok' }]),
   },
+  debugger: {
+    attach: vi.fn().mockResolvedValue(undefined),
+    sendCommand: vi.fn().mockImplementation((_, method) => {
+      if (method === 'Page.getFrameTree') {
+        return Promise.resolve({ frameTree: { frame: { id: 'main-frame' } } });
+      }
+      if (method === 'Page.createIsolatedWorld') {
+        return Promise.resolve({ executionContextId: 7 });
+      }
+      if (method === 'Runtime.evaluate') {
+        return Promise.resolve({ result: { value: 80 } });
+      }
+      return Promise.resolve({});
+    }),
+    detach: vi.fn().mockResolvedValue(undefined),
+    onEvent: {
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+    },
+  },
 };
 
 (globalThis as unknown as Record<string, unknown>).chrome = mockChrome;
@@ -54,6 +74,7 @@ describe('createToolHandler', () => {
   let ctx: BrowserContext;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     ctx = createMockBrowserContext();
     handler = createToolHandler(ctx);
   });
@@ -87,6 +108,80 @@ describe('createToolHandler', () => {
 
   it('switch_tab throws when tab_id is missing', async () => {
     await expect(handler('switch_tab', {} as Record<string, unknown>)).rejects.toThrow('tab_id is required');
+  });
+
+  it('execute_script evaluates in CDP Runtime instead of extension script injection', async () => {
+    const result = await handler('execute_script', {
+      code: "document.querySelectorAll('.question_box').length",
+    });
+
+    expect(mockChrome.debugger.attach).toHaveBeenCalledWith({ tabId: 1 }, '1.3');
+    expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Page.enable');
+    expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Runtime.enable');
+    expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith({ tabId: 1 }, 'Page.getFrameTree');
+    expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+      { tabId: 1 },
+      'Page.createIsolatedWorld',
+      {
+        frameId: 'main-frame',
+        worldName: 'nabo_mcp_lite',
+        grantUniveralAccess: true,
+      },
+    );
+    expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+      { tabId: 1 },
+      'Runtime.evaluate',
+      {
+        expression: "document.querySelectorAll('.question_box').length",
+        awaitPromise: true,
+        contextId: 7,
+        returnByValue: true,
+        userGesture: true,
+      },
+    );
+    expect(mockChrome.debugger.detach).not.toHaveBeenCalled();
+    expect(mockChrome.scripting.executeScript).not.toHaveBeenCalled();
+    expect(result).toEqual({ result: 80, mode: 'cdp' });
+  });
+
+  it('execute_script reuses an existing debugger attachment when Chrome reports one is already attached', async () => {
+    vi.mocked(mockChrome.debugger.attach).mockRejectedValueOnce(
+      new Error('Another debugger is already attached to the tab with id: 1.'),
+    );
+
+    const result = await handler('execute_script', {
+      code: "document.querySelectorAll('.question_box').length",
+    });
+
+    expect(mockChrome.debugger.attach).toHaveBeenCalledWith({ tabId: 1 }, '1.3');
+    expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+      { tabId: 1 },
+      'Runtime.evaluate',
+      expect.objectContaining({ contextId: 7 }),
+    );
+    expect(mockChrome.debugger.detach).not.toHaveBeenCalled();
+    expect(result).toEqual({ result: 80, mode: 'cdp' });
+  });
+
+  it('execute_script reuses the same CDP execution context for repeated calls on a tab', async () => {
+    await handler('execute_script', { code: '1 + 1' });
+    await handler('execute_script', { code: "document.querySelectorAll('.question_box').length" });
+
+    expect(mockChrome.debugger.attach).toHaveBeenCalledTimes(1);
+    expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+      { tabId: 1 },
+      'Runtime.evaluate',
+      expect.objectContaining({ expression: '1 + 1', contextId: 7 }),
+    );
+    expect(mockChrome.debugger.sendCommand).toHaveBeenCalledWith(
+      { tabId: 1 },
+      'Runtime.evaluate',
+      expect.objectContaining({
+        expression: "document.querySelectorAll('.question_box').length",
+        contextId: 7,
+      }),
+    );
+    expect(mockChrome.debugger.detach).not.toHaveBeenCalled();
   });
 
   it('throws on unknown tool', async () => {

@@ -4,7 +4,117 @@ import { DEFAULT_INCLUDE_ATTRIBUTES } from './browser/dom/views';
 
 const MAX_PAGE_TEXT_CHARS = 50_000;
 
+type CdpRuntimeEvaluateResponse = {
+  result?: {
+    type?: string;
+    value?: unknown;
+    unserializableValue?: string;
+    description?: string;
+  };
+  exceptionDetails?: {
+    text?: string;
+    exception?: {
+      description?: string;
+      value?: unknown;
+    };
+  };
+};
+
+type CdpFrameTreeResponse = {
+  frameTree?: {
+    frame?: {
+      id?: string;
+    };
+  };
+};
+
+type CdpCreateIsolatedWorldResponse = {
+  executionContextId?: number;
+};
+
+async function createMainFrameExecutionContext(debuggee: chrome.debugger.Debuggee): Promise<number | undefined> {
+  await chrome.debugger.sendCommand(debuggee, 'Page.enable');
+  await chrome.debugger.sendCommand(debuggee, 'Runtime.enable');
+  const frameTree = (await chrome.debugger.sendCommand(debuggee, 'Page.getFrameTree')) as CdpFrameTreeResponse;
+  const mainFrameId = frameTree.frameTree?.frame?.id;
+  if (!mainFrameId) return undefined;
+
+  const isolatedWorld = (await chrome.debugger.sendCommand(debuggee, 'Page.createIsolatedWorld', {
+    frameId: mainFrameId,
+    worldName: 'nabo_mcp_lite',
+    grantUniveralAccess: true,
+  })) as CdpCreateIsolatedWorldResponse;
+
+  if (typeof isolatedWorld.executionContextId !== 'number') {
+    return undefined;
+  }
+  return isolatedWorld.executionContextId;
+}
+
+interface CdpTabSession {
+  debuggee: chrome.debugger.Debuggee;
+  contextId: number;
+  attachedByUs: boolean;
+}
+
+async function evaluateScriptWithCdp(
+  sessions: Map<number, CdpTabSession>,
+  tabId: number,
+  expression: string,
+): Promise<unknown> {
+  const debuggee = { tabId };
+  let session = sessions.get(tabId);
+
+  if (!session) {
+    let attachedByUs = false;
+    try {
+      await chrome.debugger.attach(debuggee, '1.3');
+      attachedByUs = true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!message.includes('Another debugger is already attached')) {
+        throw err;
+      }
+    }
+    const contextId = await createMainFrameExecutionContext(debuggee);
+    if (typeof contextId !== 'number') {
+      throw new Error('Failed to create a page execution context for CDP evaluation');
+    }
+    session = { debuggee, contextId, attachedByUs };
+    sessions.set(tabId, session);
+  }
+
+  try {
+    const response = (await chrome.debugger.sendCommand(debuggee, 'Runtime.evaluate', {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+      userGesture: true,
+      contextId: session.contextId,
+    })) as CdpRuntimeEvaluateResponse;
+
+    if (response.exceptionDetails) {
+      const exception = response.exceptionDetails.exception;
+      const message =
+        exception?.description ||
+        String(exception?.value ?? '') ||
+        response.exceptionDetails.text ||
+        'CDP Runtime.evaluate failed';
+      throw new Error(message);
+    }
+
+    if (response.result && 'value' in response.result) return response.result.value;
+    if (response.result?.unserializableValue) return response.result.unserializableValue;
+    return response.result?.description ?? null;
+  } catch (err) {
+    sessions.delete(tabId);
+    throw err;
+  }
+}
+
 export function createToolHandler(browserContext: BrowserContext) {
+  const cdpSessions = new Map<number, CdpTabSession>();
+
   return async function handleTool(tool: string, args: Record<string, unknown>): Promise<unknown> {
     switch (tool) {
       // ── Tab management ──
@@ -143,12 +253,8 @@ export function createToolHandler(browserContext: BrowserContext) {
         if (!code) throw new Error('code is required');
         const page = await browserContext.getCurrentPage();
         if (!page) throw new Error('No active page');
-        const result = await chrome.scripting.executeScript({
-          target: { tabId: page.tabId },
-          func: new Function(code) as (...args: unknown[]) => unknown,
-          world: 'MAIN',
-        });
-        return { result: result[0]?.result };
+        const result = await evaluateScriptWithCdp(cdpSessions, page.tabId, code);
+        return { result, mode: 'cdp' };
       }
 
       default:

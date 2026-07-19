@@ -176,12 +176,26 @@ async function run() {
       pageText.truncated,
     );
 
+    console.log('6. Sending execute_script...');
+    const scriptCallResult = await send(proc, 'tools/call', {
+      name: 'execute_script',
+      arguments: { code: '1 + 1' },
+    });
+    const scriptResult = JSON.parse(scriptCallResult.content[0].text);
+    if (scriptResult.mode !== 'cdp') {
+      throw new Error('Loaded extension is stale: execute_script did not use CDP mode');
+    }
+    if (scriptResult.result !== 2) {
+      throw new Error(`execute_script returned ${scriptResult.result}; expected 2`);
+    }
+    console.log('   EXECUTE_SCRIPT_OK — mode:', scriptResult.mode, 'result:', scriptResult.result);
+
     // ── 6. Wait 45s idle ──
-    console.log(`6. Waiting ${IDLE_WAIT_MS / 1000}s for idle period...`);
+    console.log(`7. Waiting ${IDLE_WAIT_MS / 1000}s for idle period...`);
     await new Promise(r => setTimeout(r, IDLE_WAIT_MS));
 
     // ── 7. list_tabs after idle ──
-    console.log('7. Sending list_tabs after idle...');
+    console.log('8. Sending list_tabs after idle...');
     const tabsResult2 = await send(proc, 'tools/call', {
       name: 'list_tabs',
       arguments: {},
