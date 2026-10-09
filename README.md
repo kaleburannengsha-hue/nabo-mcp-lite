@@ -8,7 +8,10 @@
 MCP Client（Claude / Codex / 其他客户端）
                  │ stdio MCP
                  ▼
-server/single-session-server.cjs
+server/nabo-client.cjs
+                 │ WebSocket 127.0.0.1:9877
+                 ▼
+server/nabo-hub.cjs
                  │ WebSocket 127.0.0.1:9876
                  ▼
 Nabo MCP Lite Chrome Extension
@@ -74,8 +77,12 @@ config/claude-desktop.example.json
     "nanobrowser": {
       "command": "node",
       "args": [
-        "D:\\path\\to\\nabo-mcp-lite\\server\\single-session-server.cjs"
-      ]
+        "D:\\path\\to\\nabo-mcp-lite\\server\\nabo-client.cjs"
+      ],
+      "env": {
+        "MCP_WS_PORT": "9876",
+        "MCP_HUB_PORT": "9877"
+      }
     }
   }
 }
@@ -84,14 +91,14 @@ config/claude-desktop.example.json
 Claude Code：
 
 ```powershell
-claude mcp add nanobrowser -- node D:\path\to\nabo-mcp-lite\server\single-session-server.cjs
+claude mcp add nanobrowser -e MCP_WS_PORT=9876 -e MCP_HUB_PORT=9877 -- node D:\path\to\nabo-mcp-lite\server\nabo-client.cjs
 ```
 
 其他客户端可参考 `config/mcp-stdio.example.json`。
 
 ## 测试真实连接
 
-确保 Chrome 已加载并刷新扩展，且没有其他进程占用 9876：
+确保 Chrome 已加载并刷新扩展：
 
 ```powershell
 $env:IDLE_WAIT_MS = "2000"
@@ -110,15 +117,15 @@ RUNTIME_TEST_OK
 
 ## 使用限制
 
-- 当前为单 Session 服务，同一时间只能有一个服务端监听 9876。
-- 多个 MCP 客户端同时启动服务端会产生端口冲突。
+- 当前为共享 Hub 模式：只有 `nabo-hub.cjs` 监听 9876，多个 `nabo-client.cjs` 可同时连接 Hub。
+- Chrome、登录态、标签页仍共享；多个 Agent 同时操作同一浏览器时，Hub 会按请求顺序转发。
 - `chrome://` 内部页面受 Chrome 安全策略限制。
 - `execute_script` 可以执行网页脚本，只应连接可信的本地 MCP 客户端。
 
 ## 文档
 
-- [完整操作指引](OPERATIONS.md)
-- [当前项目状态](STATUS.md)
+- [完整操作指引](./OPERATIONS.md)
+- [当前项目状态](./STATUS.md)
 - [配置示例](config)
 
 ## 来源与许可证

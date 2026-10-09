@@ -2,9 +2,17 @@
 'use strict';
 
 const { spawn } = require('child_process');
+const path = require('path');
 
-const cp = spawn(process.execPath, ['server/single-session-server.cjs'], {
+const hub = spawn(process.execPath, [path.resolve('server/nabo-hub.cjs')], {
   cwd: process.cwd(),
+  env: { ...process.env, NABO_CLIENT_AUTOSTART: '0' },
+  stdio: ['ignore', 'ignore', 'pipe'],
+});
+
+const cp = spawn(process.execPath, [path.resolve('server/nabo-client.cjs')], {
+  cwd: process.cwd(),
+  env: { ...process.env, NABO_CLIENT_AUTOSTART: '0' },
   stdio: ['pipe', 'pipe', 'pipe'],
 });
 
@@ -56,6 +64,7 @@ cp.stdout.on('data', chunk => {
 });
 
 cp.stderr.on('data', chunk => process.stderr.write('[server] ' + chunk.toString()));
+hub.stderr.on('data', chunk => process.stderr.write('[hub] ' + chunk.toString()));
 
 async function main() {
   await send('initialize', {
@@ -108,4 +117,5 @@ main()
   })
   .finally(() => {
     cp.kill();
+    hub.kill();
   });

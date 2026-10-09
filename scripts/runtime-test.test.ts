@@ -14,10 +14,9 @@ describe('runtime-test configuration', () => {
   });
 
   it('loads ws through the package entry point instead of a pnpm version path', () => {
-    const serverPath = fileURLToPath(
-      new URL('../server/single-session-server.cjs', import.meta.url),
-    );
-    const source = readFileSync(serverPath, 'utf8');
+    const hubPath = fileURLToPath(new URL('../server/nabo-hub.cjs', import.meta.url));
+    const clientPath = fileURLToPath(new URL('../server/nabo-client.cjs', import.meta.url));
+    const source = readFileSync(hubPath, 'utf8') + readFileSync(clientPath, 'utf8');
 
     expect(source).toContain("require('ws')");
     expect(source).not.toContain('node_modules/.pnpm/ws@');

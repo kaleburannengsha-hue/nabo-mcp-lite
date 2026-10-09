@@ -133,13 +133,22 @@ async function _buildDomTree(
     return [elementTree, new Map<number, DOMElementNode>()];
   }
 
+  for (const k of Object.keys(lastScanTrace)) delete lastScanTrace[k];
+  lastScanTrace.url = url;
+
   await injectBuildDomTreeScripts(tabId);
 
   const mainFrameResult = await chrome.scripting.executeScript({
     target: { tabId },
     func: args => {
-      // Access buildDomTree from the window context of the target page
-      return window.buildDomTree(args);
+      // Access buildDomTree from the window context of the target page.
+      // Wrapped so an exception inside the page script surfaces as a message
+      // instead of an undefined result that looks like "nothing clickable".
+      try {
+        return { ok: true, result: window.buildDomTree(args) };
+      } catch (err) {
+        return { ok: false, error: `${(err as Error)?.name || 'Error'}: ${(err as Error)?.message || String(err)}` };
+      }
     },
     args: [
       {
@@ -153,12 +162,22 @@ async function _buildDomTree(
     ],
   });
 
+  const wrapped = mainFrameResult[0]?.result as unknown as
+    | { ok: true; result: BuildDomTreeResult }
+    | { ok: false; error: string }
+    | undefined;
+  if (wrapped && wrapped.ok === false) {
+    throw new Error(`buildDomTree threw in the page: ${wrapped.error}`);
+  }
+
   // First cast to unknown, then to BuildDomTreeResult
-  let mainFramePage = mainFrameResult[0]?.result as unknown as BuildDomTreeResult;
+  let mainFramePage = (wrapped && wrapped.ok ? wrapped.result : wrapped) as unknown as BuildDomTreeResult;
   if (!mainFramePage || !mainFramePage.map || !mainFramePage.rootId) {
     throw new Error('Failed to build DOM tree: No result returned or invalid structure');
   }
 
+  lastScanTrace.mainMapKeys = Object.keys(mainFramePage.map || {}).length;
+  lastScanTrace.mainRootId = mainFramePage.rootId;
   if (debugMode && mainFramePage.perfMetrics) {
     logger.debug('DOM Tree Building Performance Metrics (main-frame):', mainFramePage.perfMetrics);
   }
@@ -167,6 +186,7 @@ async function _buildDomTree(
   // We'd need to detect that  here, build the DOM tree there for each subframe, and construct it here.
   const visibleIframesFailedLoading = _visibleIFramesFailedLoading(mainFramePage);
   const visibleIframesFailedLoadingCount = Object.values(visibleIframesFailedLoading).length;
+  lastScanTrace.framesFailedLoading = visibleIframesFailedLoadingCount;
   if (visibleIframesFailedLoadingCount > 0) {
     const tabFrames = await chrome.webNavigation.getAllFrames({ tabId });
     const subFrames = (tabFrames ?? []).filter(frame => frame.frameId !== mainFrameResult[0].frameId).sort();
@@ -175,19 +195,26 @@ async function _buildDomTree(
     // to avoid double parsing & highlighting on the frames that succeeded.
     const frameInfoResultsRaw = await Promise.all(
       subFrames.map(async frame => {
-        const result = await chrome.scripting.executeScript({
-          target: { tabId, frameIds: [frame.frameId] },
-          func: frameId => ({
-            frameId,
-            computedHeight: window.innerHeight,
-            computedWidth: window.innerWidth,
-            href: window.location.href,
-            name: window.name,
-            title: document.title,
-          }),
-          args: [frame.frameId],
-        });
-        return result[0].result;
+        try {
+          const result = await chrome.scripting.executeScript({
+            target: { tabId, frameIds: [frame.frameId] },
+            func: frameId => ({
+              frameId,
+              computedHeight: window.innerHeight,
+              computedWidth: window.innerWidth,
+              href: window.location.href,
+              name: window.name,
+              title: document.title,
+            }),
+            args: [frame.frameId],
+          });
+          return result[0].result;
+        } catch (err) {
+          // Error pages, sandboxed ad frames, frames torn down mid-flight:
+          // skip them rather than failing the whole scan.
+          logger.warning('skipping unreadable sub-frame', frame.frameId, err);
+          return null;
+        }
       }),
     );
     const frameInfoResults = frameInfoResultsRaw.filter(isNotNull);
@@ -206,7 +233,10 @@ async function _buildDomTree(
     mainFramePage = frameTreeResult.resultPage;
   }
 
-  return _constructDomTree(mainFramePage);
+  const built = _constructDomTree(mainFramePage);
+  lastScanTrace.finalSelectorMapSize = built[1].size;
+  lastScanTrace.finalTreeChildren = built[0].children.length;
+  return built;
 }
 
 async function constructFrameTree(
@@ -239,27 +269,47 @@ async function constructFrameTree(
 
   for (const subFrame of failedLoadingFrames) {
     // Processing one frame at a time, to start from the proper highlightIndex and element id.
-    const subFrameResult = await chrome.scripting.executeScript({
-      target: { tabId, frameIds: [subFrame.frameId] },
-      func: args => {
-        // Access buildDomTree from the window context of the target page
-        return window.buildDomTree({ ...args });
-      },
-      args: [
-        {
-          showHighlightElements,
-          focusHighlightIndex: focusElement,
-          viewportExpansion,
-          startId: maxNodeId + 1,
-          startHighlightIndex: maxHighlightIndex + 1,
-          debugMode,
+    let subFrameResult: chrome.scripting.InjectionResult<unknown>[];
+    try {
+      subFrameResult = await chrome.scripting.executeScript({
+        target: { tabId, frameIds: [subFrame.frameId] },
+        func: args => {
+          // Access buildDomTree from the window context of the target page.
+          // Never let one frame's failure discard the frames that worked.
+          try {
+            return { ok: true, result: window.buildDomTree({ ...args }) };
+          } catch (err) {
+            return { ok: false, error: `${(err as Error)?.message || String(err)}` };
+          }
         },
-      ],
-    });
+        args: [
+          {
+            showHighlightElements,
+            focusHighlightIndex: focusElement,
+            viewportExpansion,
+            startId: maxNodeId + 1,
+            startHighlightIndex: maxHighlightIndex + 1,
+            debugMode,
+          },
+        ],
+      });
+    } catch (err) {
+      logger.warning('skipping unreadable sub-frame', subFrame.frameId, err);
+      continue;
+    }
 
-    const subFramePage = subFrameResult[0]?.result as unknown as BuildDomTreeResult;
+    const wrappedSub = subFrameResult[0]?.result as unknown as
+      | { ok: true; result: BuildDomTreeResult }
+      | { ok: false; error: string }
+      | undefined;
+    if (wrappedSub && wrappedSub.ok === false) {
+      logger.warning('buildDomTree failed in sub-frame, skipping it', subFrame.frameId, wrappedSub.error);
+      continue;
+    }
+    const subFramePage = (wrappedSub && wrappedSub.ok ? wrappedSub.result : wrappedSub) as unknown as BuildDomTreeResult;
     if (!subFramePage || !subFramePage.map || !subFramePage.rootId) {
-      throw new Error('Failed to build DOM tree: No result returned or invalid structure');
+      logger.warning('skipping sub-frame with empty result', subFrame.frameId);
+      continue;
     }
     if (debugMode && subFramePage.perfMetrics) {
       logger.debug(
@@ -309,6 +359,9 @@ async function constructFrameTree(
       maxHighlightIndex = Math.max(maxHighlightIndex, result.maxHighlightIndex);
     }
   }
+
+  lastScanTrace.mergedMapKeys = Object.keys(parentFramePage.map || {}).length;
+  lastScanTrace.mergedRootId = parentFramePage.rootId;
 
   return {
     maxNodeId,
@@ -405,6 +458,12 @@ function _visibleIFramesFailedLoading(result: BuildDomTreeResult): Record<string
  * @param evalPage - The result of building the DOM tree.
  * @returns A tuple containing the DOM element tree and selector map.
  */
+/**
+ * Stage-by-stage trace of the most recent scan, for diagnosing empty results.
+ * Filled by _buildDomTree; read by get_dom's scanDiagnostics.
+ */
+export const lastScanTrace: Record<string, unknown> = {};
+
 function _constructDomTree(evalPage: BuildDomTreeResult): [DOMElementNode, Map<number, DOMElementNode>] {
   const jsNodeMap = evalPage.map;
   const jsRootId = evalPage.rootId;
@@ -579,46 +638,186 @@ export async function getScrollInfo(tabId: number): Promise<[number, number, num
 }
 
 // Function to check if script is already injected
-async function scriptInjectedFrames(tabId: number): Promise<Map<number, boolean>> {
+async function scriptInjectedFrames(tabId: number): Promise<{ frames: Map<number, boolean>; error?: string }> {
   try {
     const results = await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
       func: () => Object.prototype.hasOwnProperty.call(window, 'buildDomTree'),
     });
-    return new Map(results.map(result => [result.frameId, result.result || false]));
+    return { frames: new Map(results.map(result => [result.frameId, result.result || false])) };
   } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
     console.error('Failed to check script injection status:', err);
-    return new Map();
+    return { frames: new Map(), error: message };
   }
 }
 
-// Function to inject the buildDomTree script
-export async function injectBuildDomTreeScripts(tabId: number) {
+/**
+ * A tab created while the browser window is minimized (or otherwise never laid
+ * out) reports window.innerWidth/innerHeight === 0. The page-side scanner only
+ * assigns highlight indices to elements inside the viewport, so such a tab
+ * scans as "nothing clickable" — silently, with no error at all.
+ *
+ * Fix: while a scan or click is running on such a tab, give it a temporary
+ * layout size via CDP and clear the override afterwards, so the browser is
+ * never left altered.
+ */
+const LAYOUT_FIX_WIDTH = 1280;
+const LAYOUT_FIX_HEIGHT = 900;
+
+export async function ensureTabLayout(tabId: number): Promise<boolean> {
+  try {
+    const [{ result }] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => window.innerWidth === 0 || window.innerHeight === 0,
+    });
+    if (!result) return false;
+
+    try {
+      await chrome.debugger.attach({ tabId }, '1.3');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (!message.includes('Another debugger is already attached')) return false;
+    }
+    await chrome.debugger.sendCommand({ tabId }, 'Emulation.setDeviceMetricsOverride', {
+      width: LAYOUT_FIX_WIDTH,
+      height: LAYOUT_FIX_HEIGHT,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    logger.info('applied temporary layout to zero-sized tab', tabId, `${LAYOUT_FIX_WIDTH}x${LAYOUT_FIX_HEIGHT}`);
+    return true;
+  } catch (err) {
+    logger.warning('failed to apply temporary layout:', err);
+    return false;
+  }
+}
+
+export async function clearTabLayout(tabId: number): Promise<void> {
+  try {
+    await chrome.debugger.sendCommand({ tabId }, 'Emulation.clearDeviceMetricsOverride');
+  } catch {
+    // The override may never have been applied, or the tab may already be gone.
+  }
+}
+
+/**
+ * Raw probe of the page-side scanner, run when a scan comes back empty.
+ * Calls buildDomTree directly and reports what it returned, so the caller can
+ * tell "page really has nothing clickable" apart from "the scanner bailed".
+ */
+export async function probeBuildDomTree(tabId: number): Promise<Record<string, unknown>> {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const out: Record<string, unknown> = {
+          hasFn: typeof (window as { buildDomTree?: unknown }).buildDomTree === 'function',
+          readyState: document.readyState,
+          elementCount: document.querySelectorAll('*').length,
+          bodyChildren: document.body ? document.body.children.length : -1,
+        };
+        const call = (showHighlightElements: boolean) =>
+          (
+            window as unknown as {
+              buildDomTree?: (args: Record<string, unknown>) => Record<string, unknown>;
+            }
+          ).buildDomTree?.({
+            showHighlightElements,
+            focusHighlightIndex: -1,
+            viewportExpansion: 0,
+            startId: 0,
+            startHighlightIndex: 0,
+            debugMode: false,
+          });
+        for (const showHighlightElements of [false, true]) {
+          const label = showHighlightElements ? 'withHighlights' : 'noHighlights';
+          try {
+            const r = call(showHighlightElements);
+            out[`${label}_mapKeys`] = r && r.map ? Object.keys(r.map as object).length : -1;
+            out[`${label}_rootId`] = r?.rootId ?? null;
+            if (!showHighlightElements && r && r.map) {
+              const vals = Object.values(r.map as Record<string, Record<string, unknown>>);
+              out.nodesWithHighlight = vals.filter(n => n && n.highlightIndex !== undefined && n.highlightIndex !== null).length;
+              out.nodesInViewport = vals.filter(n => n && n.isInViewport === true).length;
+              out.nodesInteractive = vals.filter(n => n && n.isInteractive === true).length;
+            }
+          } catch (e) {
+            out[`${label}_threw`] = (e as Error)?.message || String(e);
+          }
+        }
+        out.viewport = {
+          innerW: window.innerWidth,
+          innerH: window.innerHeight,
+          docClientH: document.documentElement.clientHeight,
+          visualH: window.visualViewport ? Math.round(window.visualViewport.height) : -1,
+          hidden: document.hidden,
+          visibilityState: document.visibilityState,
+        };
+        return out;
+      },
+    });
+    return (results[0]?.result as Record<string, unknown>) ?? { probeFailed: true };
+  } catch (err) {
+    return { probeError: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Diagnostics for a scan that produced nothing — surfaced in the get_dom result. */
+export interface InjectionReport {
+  checkedFrames: number;
+  alreadyInjected: number;
+  injectedNow: string[];
+  errors: string[];
+}
+
+/**
+ * Inject the buildDomTree script.
+ *
+ * `force` re-injects even where the presence check says the script is already
+ * there. That check only proves a `window.buildDomTree` exists, not that it
+ * still works: a copy left over from an earlier document can be present but
+ * dead, and then every scan returns an empty tree with no error at all.
+ * Callers use force for a retry after an empty scan.
+ */
+export async function injectBuildDomTreeScripts(tabId: number, force = false): Promise<InjectionReport> {
+  const report: InjectionReport = { checkedFrames: 0, alreadyInjected: 0, injectedNow: [], errors: [] };
   try {
     // Check if already injected
-    const injectedFrames = await scriptInjectedFrames(tabId);
+    const { frames: injectedFrames, error: checkError } = await scriptInjectedFrames(tabId);
+    if (checkError) report.errors.push(`frame check: ${checkError}`);
+    report.checkedFrames = injectedFrames.size;
+    report.alreadyInjected = Array.from(injectedFrames.values()).filter(Boolean).length;
 
-    // If we couldn't check any frames or all are already injected, try to inject in main frame only
-    if (injectedFrames.size === 0) {
-      // Couldn't check frames, so just try to inject in the main frame
-      try {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          files: ['buildDomTree.js'],
-        });
-      } catch (injectionErr) {
-        // Silently ignore - script might already be injected or frame might be inaccessible
+    if (!force) {
+      // If we couldn't check any frames or all are already injected, try to inject in main frame only
+      if (injectedFrames.size === 0) {
+        // Couldn't check frames, so just try to inject in the main frame
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId },
+            files: ['buildDomTree.js'],
+          });
+          report.injectedNow.push('main-frame(fallback)');
+        } catch (injectionErr) {
+          report.errors.push(
+            `fallback injection: ${injectionErr instanceof Error ? injectionErr.message : String(injectionErr)}`,
+          );
+        }
+        return report;
       }
-      return;
+
+      // Check if all frames already have the script
+      if (Array.from(injectedFrames.values()).every(injected => injected)) {
+        return report;
+      }
     }
 
-    // Check if all frames already have the script
-    if (Array.from(injectedFrames.values()).every(injected => injected)) {
-      return;
-    }
+    // Inject into the frames that need it (all of them when forced)
+    const frameIdsToInject = force
+      ? Array.from(injectedFrames.keys())
+      : Array.from(injectedFrames.keys()).filter(id => !injectedFrames.get(id));
 
-    // Inject only in frames that don't have the script
-    const frameIdsToInject = Array.from(injectedFrames.keys()).filter(id => !injectedFrames.get(id));
     if (frameIdsToInject.length > 0) {
       await chrome.scripting.executeScript({
         target: {
@@ -627,8 +826,17 @@ export async function injectBuildDomTreeScripts(tabId: number) {
         },
         files: ['buildDomTree.js'],
       });
+      report.injectedNow.push(...frameIdsToInject.map(id => (force ? `force:${id}` : String(id))));
+    } else if (force || injectedFrames.size === 0) {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: ['buildDomTree.js'],
+      });
+      report.injectedNow.push(force ? 'force:main-frame' : 'main-frame');
     }
   } catch (err) {
+    report.errors.push(err instanceof Error ? err.message : String(err));
     console.error('Failed to inject scripts:', err);
   }
+  return report;
 }

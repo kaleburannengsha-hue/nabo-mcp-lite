@@ -10,3 +10,6 @@ Thumbs.db
 .idea/
 .vscode/
 docs/superpowers/
+screenshots/
+*.bak
+*.bak-*

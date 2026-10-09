@@ -1,21 +1,37 @@
 #!/usr/bin/env node
-// scripts/runtime-test.cjs — Lite single-session baseline verification
+// scripts/runtime-test.cjs — shared Hub baseline verification.
 // Usage: node scripts/runtime-test.cjs
 //
-// This test starts the single-session MCP server and drives an MCP JSON-RPC
-// conversation over stdio.  The Chrome extension must be loaded from dist/
-// for browser-dependent tools (list_tabs, get_dom) to succeed.
+// This test starts the shared Hub plus one stdio MCP client. The Chrome
+// extension must be loaded from dist/ for browser-dependent tools to succeed.
 'use strict';
 
 const { spawn } = require('child_process');
 const path = require('path');
 
-const SERVER_PATH = path.resolve(__dirname, '..', 'server', 'single-session-server.cjs');
+const HUB_PATH = path.resolve(__dirname, '..', 'server', 'nabo-hub.cjs');
+const CLIENT_PATH = path.resolve(__dirname, '..', 'server', 'nabo-client.cjs');
 const IDLE_WAIT_MS = parseInt(process.env.IDLE_WAIT_MS || '45000', 10);
 const WS_PORT = parseInt(process.env.MCP_WS_PORT || '9876', 10);
+const HUB_PORT = parseInt(process.env.MCP_HUB_PORT || '9877', 10);
 const TIMEOUT_MS = 120000;
 
 let reqId = 0;
+
+function spawnNode(script, name) {
+  const proc = spawn(process.execPath, [script], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      MCP_WS_PORT: String(WS_PORT),
+      MCP_HUB_PORT: String(HUB_PORT),
+      NABO_CLIENT_AUTOSTART: '0',
+    },
+  });
+  proc.name = name;
+  proc.pending = new Map();
+  return proc;
+}
 
 function send(proc, method, params) {
   const id = String(++reqId);
@@ -23,8 +39,6 @@ function send(proc, method, params) {
   if (params) msg.params = params;
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`Timeout: ${method}`)), 30000);
-    proc.onData = null;
-    proc.pending = proc.pending || new Map();
     proc.pending.set(id, { resolve, reject, timer });
     proc.stdin.write(JSON.stringify(msg) + '\n');
   });
@@ -33,7 +47,7 @@ function send(proc, method, params) {
 function collectOutput(proc, line) {
   try {
     const msg = JSON.parse(line);
-    if (msg.id && proc.pending && proc.pending.has(msg.id)) {
+    if (msg.id && proc.pending.has(msg.id)) {
       const p = proc.pending.get(msg.id);
       clearTimeout(p.timer);
       proc.pending.delete(msg.id);
@@ -68,14 +82,17 @@ async function waitForExtension(proc, attempts = 10, delayMs = 1000) {
 
 async function run() {
   console.log('=== Nabo MCP Lite Runtime Test ===\n');
+  console.log(`Hub port: ${HUB_PORT}; extension port: ${WS_PORT}`);
 
-  // ── 1. Start server ──
-  const proc = spawn('node', [SERVER_PATH], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, MCP_WS_PORT: String(WS_PORT) },
+  const hub = spawnNode(HUB_PATH, 'hub');
+  hub.stderr.on('data', d => {
+    const msg = d.toString().trim();
+    if (msg) console.error('[hub]', msg);
   });
-  proc.pending = new Map();
 
+  await new Promise(r => setTimeout(r, 700));
+
+  const proc = spawnNode(CLIENT_PATH, 'client');
   let buffer = '';
   proc.stdout.on('data', chunk => {
     buffer += chunk.toString();
@@ -85,19 +102,17 @@ async function run() {
       if (line.trim()) collectOutput(proc, line);
     }
   });
-
   proc.stderr.on('data', d => {
     const msg = d.toString().trim();
-    if (msg) console.error('[server]', msg);
+    if (msg) console.error('[client]', msg);
   });
 
-  // Allow server to start
-  await new Promise(r => setTimeout(r, 500));
-
-  const timer = setTimeout(() => { proc.kill(); }, TIMEOUT_MS);
+  const timer = setTimeout(() => {
+    proc.kill();
+    hub.kill();
+  }, TIMEOUT_MS);
 
   try {
-    // ── 2. Initialize ──
     console.log('1. Sending initialize...');
     const initResult = await send(proc, 'initialize', {
       protocolVersion: '2024-11-05',
@@ -110,10 +125,8 @@ async function run() {
       throw new Error('Unexpected serverInfo: ' + JSON.stringify(initResult.serverInfo));
     }
 
-    // Send initialized notification
     proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
 
-    // ── 3. tools/list ──
     console.log('2. Sending tools/list...');
     const toolsResult = await send(proc, 'tools/list', {});
     const toolNames = (toolsResult.tools || []).map(t => t.name).sort();
@@ -131,22 +144,24 @@ async function run() {
       console.log('   WARN: Tool mismatch. Missing:', missing, 'Extra:', extra);
     }
 
-    // ── 4. list_tabs (requires extension) ──
-    console.log(`3. Sending list_tabs through extension on port ${WS_PORT}...`);
+    console.log(`3. Sending list_tabs through Hub and extension on port ${WS_PORT}...`);
     const tabsResult = await waitForExtension(proc);
     const text = JSON.parse(tabsResult.content[0].text);
     console.log('   FIRST_CALL_OK —', text.length, 'tabs');
 
-    const testTab = text.find(tab => /^https?:\/\//.test(tab.url || ''));
+    const testTab =
+      text.find(tab => tab.active && /^https?:\/\//.test(tab.url || '')) ||
+      text.find(tab => /^https?:\/\//.test(tab.url || ''));
     if (!testTab) {
       throw new Error('No regular http(s) tab is available for browser tool verification');
     }
-    await send(proc, 'tools/call', {
-      name: 'switch_tab',
-      arguments: { tab_id: testTab.id },
-    });
+    if (!testTab.active) {
+      await send(proc, 'tools/call', {
+        name: 'switch_tab',
+        arguments: { tab_id: testTab.id },
+      });
+    }
 
-    // ── 5. get_dom and bounded get_page_text (require extension) ──
     console.log('4. Sending get_dom...');
     const domResult = await send(proc, 'tools/call', {
       name: 'get_dom',
@@ -190,11 +205,9 @@ async function run() {
     }
     console.log('   EXECUTE_SCRIPT_OK — mode:', scriptResult.mode, 'result:', scriptResult.result);
 
-    // ── 6. Wait 45s idle ──
     console.log(`7. Waiting ${IDLE_WAIT_MS / 1000}s for idle period...`);
     await new Promise(r => setTimeout(r, IDLE_WAIT_MS));
 
-    // ── 7. list_tabs after idle ──
     console.log('8. Sending list_tabs after idle...');
     const tabsResult2 = await send(proc, 'tools/call', {
       name: 'list_tabs',
@@ -206,7 +219,8 @@ async function run() {
   } finally {
     clearTimeout(timer);
     proc.kill();
-    await new Promise(r => setTimeout(r, 200));
+    hub.kill();
+    await new Promise(r => setTimeout(r, 300));
   }
 }
 

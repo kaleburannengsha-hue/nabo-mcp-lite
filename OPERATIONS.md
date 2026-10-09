@@ -6,7 +6,10 @@
 Agent（Claude / Codex / 其他 MCP 客户端）
           │ MCP stdio
           ▼
-server/single-session-server.cjs
+server/nabo-client.cjs
+          │ WebSocket 127.0.0.1:9877
+          ▼
+server/nabo-hub.cjs
           │ WebSocket 127.0.0.1:9876
           ▼
 Chrome 扩展
@@ -15,7 +18,7 @@ Chrome 扩展
 网页标签页
 ```
 
-`single-session-server.cjs` 是 MCP 服务端，也是 Agent 与 Chrome 扩展之间的桥接程序。扩展不能单独接受 Agent 调用，服务端也不能在没有扩展连接时操作网页。
+`nabo-hub.cjs` 是共享 Hub，也是 Chrome 扩展唯一连接的桥接程序。`nabo-client.cjs` 是各个 Agent 启动的 stdio MCP 入口，多个 Agent 可以同时启动多个 client，并共享同一个 Hub、Chrome 和标签页。
 
 ## 2. 环境要求
 
@@ -23,12 +26,12 @@ Chrome 扩展
 - Node.js 18 或更高版本
 - pnpm
 - Google Chrome
-- 项目目录：`D:\claude\bower\nabo-mcp-lite`
+- 项目目录：`D:\all_code\tools\localbower`
 
 ## 3. 安装依赖和构建
 
 ```powershell
-cd D:\claude\bower\nabo-mcp-lite
+cd D:\all_code\tools\localbower
 pnpm install
 pnpm test
 pnpm type-check
@@ -38,7 +41,7 @@ pnpm build
 构建结果位于：
 
 ```text
-D:\claude\bower\nabo-mcp-lite\dist
+D:\all_code\tools\localbower\dist
 ```
 
 ## 4. 在 Chrome 中加载扩展
@@ -46,7 +49,7 @@ D:\claude\bower\nabo-mcp-lite\dist
 1. 打开 `chrome://extensions`。
 2. 开启右上角“开发者模式”。
 3. 点击“加载已解压的扩展程序”。
-4. 选择 `D:\claude\bower\nabo-mcp-lite\dist`。
+4. 选择 `D:\all_code\tools\localbower\dist`。
 5. 确认扩展名称是 `Nabo MCP Lite`。
 
 每次重新执行 `pnpm build` 后，都要回到 `chrome://extensions`，点击该扩展卡片上的刷新按钮。仅刷新普通网页不会重新加载扩展 Service Worker。
@@ -69,8 +72,12 @@ Claude Desktop 常见配置文件：
     "nanobrowser": {
       "command": "node",
       "args": [
-        "D:\\claude\\bower\\nabo-mcp-lite\\server\\single-session-server.cjs"
-      ]
+        "D:\\all_code\\tools\\localbower\\server\\nabo-client.cjs"
+      ],
+      "env": {
+        "MCP_WS_PORT": "9876",
+        "MCP_HUB_PORT": "9877"
+      }
     }
   }
 }
@@ -83,7 +90,7 @@ Claude Desktop 常见配置文件：
 可使用命令：
 
 ```powershell
-claude mcp add nanobrowser -- node D:\claude\bower\nabo-mcp-lite\server\single-session-server.cjs
+claude mcp add nanobrowser -e MCP_WS_PORT=9876 -e MCP_HUB_PORT=9877 -- node D:\all_code\tools\localbower\server\nabo-client.cjs
 ```
 
 不同版本的 Claude Code 配置位置可能不同，可用下面命令确认：
@@ -98,23 +105,24 @@ claude mcp list
 
 ```text
 command: node
-args: D:\claude\bower\nabo-mcp-lite\server\single-session-server.cjs
+args: D:\all_code\tools\localbower\server\nabo-client.cjs
 ```
 
 它并非只能供 Claude 使用。
 
 ## 6. 启动和连接
 
-正常情况下不需要手动运行服务端。MCP 客户端启动时会自动运行：
+正常情况下不需要手动运行 Hub。MCP 客户端启动时会自动运行：
 
 ```powershell
-node D:\claude\bower\nabo-mcp-lite\server\single-session-server.cjs
+node D:\all_code\tools\localbower\server\nabo-client.cjs
 ```
 
-服务端启动后监听：
+如果 Hub 尚未运行，client 会自动拉起：
 
 ```text
-ws://127.0.0.1:9876
+Hub:       ws://127.0.0.1:9877
+Extension: ws://127.0.0.1:9876
 ```
 
 扩展会自动连接。首次连接或扩展重载后，通常等待 1 到 3 秒即可。
@@ -124,7 +132,7 @@ ws://127.0.0.1:9876
 先退出会自动占用 9876 端口的 Claude/Codex MCP 会话，然后运行：
 
 ```powershell
-cd D:\claude\bower\nabo-mcp-lite
+cd D:\all_code\tools\localbower
 $env:IDLE_WAIT_MS = "2000"
 node scripts/runtime-test.cjs
 ```
@@ -143,9 +151,9 @@ RUNTIME_TEST_OK
 
 ## 8. 如何关闭
 
-### 关闭服务端
+### 关闭 Hub
 
-通常关闭对应的 Claude、Codex 或其他 MCP 客户端即可。
+通常关闭所有 Claude、Codex 或其他 MCP 客户端即可。若 client 自动拉起了后台 Hub，可手动查找并关闭 `nabo-hub.cjs` 对应 Node 进程。
 
 手动查找占用 9876 的进程：
 
@@ -168,19 +176,18 @@ Stop-Process -Id <PID>
 
 ## 9. 多 Session 和冲突
 
-当前服务端是单 Session 设计：
+当前服务端是共享 Hub 设计：
 
-- 一个服务端进程只维护一个扩展连接。
-- 同一时间只能有一个进程监听 9876。
-- Claude Desktop、Claude Code、Codex 如果同时各自启动服务端，会发生端口冲突。
-- 新 Session 不能直接接管旧 Session 已启动的 stdio 服务端。
+- 只有一个 Hub 进程监听 9876，供 Chrome 扩展连接。
+- 多个 `nabo-client.cjs` 可以同时连接 Hub 的 9877 端口。
+- Claude Desktop、Claude Code、Codex 可以同时配置同一个 `nabo-client.cjs`。
+- Chrome、登录态、标签页共享；浏览器操作由 Hub 按请求顺序转发。
 
 切换 Agent Session 时，建议：
 
-1. 关闭旧 Session 或退出旧 MCP 客户端。
-2. 确认 9876 已释放。
-3. 启动新 Session。
-4. 等待扩展自动重连。
+1. 启动新 Session。
+2. 等待 client 连接 Hub。
+3. 如遇到 `Extension not connected`，刷新扩展或确认 Hub 正在监听 9876。
 
 不需要重新加载扩展；只有重新构建扩展、Service Worker 异常或长时间未重连时才需要点击扩展刷新。
 
@@ -188,7 +195,7 @@ Stop-Process -Id <PID>
 
 ### `EADDRINUSE 127.0.0.1:9876`
 
-已有服务端占用端口。关闭旧 MCP 会话或对应 Node 进程。
+已有 Hub 占用端口。正常情况下这是预期现象；请确认客户端配置指向 `nabo-client.cjs`，不要再直接启动 `nabo-hub.cjs` 或旧服务端入口。
 
 ### `Extension not connected`
 
@@ -196,9 +203,9 @@ Stop-Process -Id <PID>
 
 1. Chrome 是否正在运行。
 2. `Nabo MCP Lite` 是否启用。
-3. 加载路径是否是 `D:\claude\bower\nabo-mcp-lite\dist`。
+3. 加载路径是否是 `D:\all_code\tools\localbower\dist`。
 4. 是否在构建后点击了扩展刷新。
-5. 服务端是否监听 9876。
+5. Hub 是否监听 9876，client 是否能连接 9877。
 
 ### 工具调用超时
 

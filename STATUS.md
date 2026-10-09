@@ -1,15 +1,39 @@
 # Nabo MCP Lite 状态
 
-> 最后更新：2026-06-21
+> 最后更新：2026-10-09
 
 ## 当前状态
 
-项目已经完成精简版 Chrome 扩展和单 Session MCP 服务端：
+项目已经完成精简版 Chrome 扩展和共享 Hub MCP 服务端：
 
 - Chrome 扩展从 `dist/` 加载。
-- 扩展通过 `ws://127.0.0.1:9876` 连接 MCP 服务端。
-- 服务端通过 stdio 向 Claude、Codex 等支持 MCP 的 Agent 暴露 14 个网页工具。
-- `list_tabs`、`switch_tab`、`get_page_text`、`get_dom` 已通过真实 Chrome 端到端调用。
+- 扩展通过 `ws://127.0.0.1:9876` 连接共享 Hub。
+- Claude、Codex 等支持 MCP 的 Agent 启动 `server/nabo-client.cjs`，多个 client 可同时连接 `ws://127.0.0.1:9877`。
+- 21 个 MCP 工具已在真实站点端到端验证。
+
+## 2026-09/10 更新（当前版本）
+
+工具从 14 个扩到 21 个，并完成一轮性能与稳定性改造：
+
+- **新工具**：`click_at`（坐标点击，canvas/地图/图表可用）、`upload_file`（CDP setFileInputFiles）、`browser_stats`（缓存/点击统计）、`reload_extension`（重载扩展），以及小红书三件套 `xhs_check_login` / `xhs_search` / `xhs_detail`。
+- **点击提速**：`click_element` 由 2747ms 降到 ~15ms——改用 bounding-rect 中心点 + CDP 真实鼠标事件（trusted），弃用会因窗口遮挡而超时的 IntersectionObserver 可见性判断。
+- **页面级 DOM 缓存**：按 (tabId, URL) 复用扫描结果，重访页面 16~300ms（原 1.1~1.3s）；`click_element` / `input_text` 复用 `get_dom` 的 selectorMap。
+- **截图三参数**：`scale`（默认 0.5，2560→1280px）、`quality`、`save`（JPEG 落盘只回路径，省 90%+ token）。
+- **稳定性**：坏 iframe 不再拖垮整页扫描；窗口最小化时扫描不再静默返回空（扫描期间临时施加设备度量覆盖）；点击前身份校验 + 唯一匹配重定位防误点；file input 直接拒绝并引导 `upload_file`。
+- **诊断**：空扫描自动附 `scanDiagnostics`；`get_dom` 返回 `pageHints`（canvas/iframe/视口尺寸）。
+- **并发**：Hub 全局 FIFO——多个 Agent 会话共享同一 Chrome 不互相踩坏页面（`scripts/concurrency-test.cjs` 实测串行）。
+
+## 2026-07-24 共享 Hub 改造
+
+旧版每个 Agent 都启动一个会监听 9876 的服务端，导致第一个 Agent 占用端口后，其他 Agent 无法连接。
+
+现在：
+
+- `server/nabo-hub.cjs` 只启动一次，监听扩展端口 9876 和 client 端口 9877。
+- `server/nabo-client.cjs` 是 Claude Desktop、Claude Code、Codex 的统一 stdio MCP 入口。
+- 多个 client 同时连接 Hub 时，Chrome、登录态、标签页共享，工具调用由 Hub 串行转发给扩展。
+- `server/single-session-server.cjs` 保留为兼容入口，内部转到 `nabo-client.cjs`。
+- 新增 `scripts/hub-runtime-test.cjs`，验证两个 stdio MCP client 共享同一个 Hub。
 
 ## 本次修复
 
@@ -41,7 +65,7 @@
 ## 常用验证命令
 
 ```powershell
-cd D:\claude\bower\nabo-mcp-lite
+cd D:\all_code\tools\localbower
 pnpm test
 pnpm type-check
 pnpm build
@@ -51,11 +75,13 @@ node scripts/runtime-test.cjs
 
 运行端到端测试前，需要满足：
 
-1. Chrome 已从 `D:\claude\bower\nabo-mcp-lite\dist` 加载扩展。
+1. Chrome 已从 `D:\all_code\tools\localbower\dist` 加载扩展。
 2. 构建后已在 `chrome://extensions` 点击扩展的刷新按钮。
 3. 9876 端口没有被另一个 MCP 服务占用。
 
-完整操作见 [OPERATIONS.md](OPERATIONS.md)。
+共享 Hub 模式下，若 9876 被 `nabo-hub.cjs` 占用是正常状态；冲突通常说明还有旧入口或手动 Hub 进程在运行。
+
+完整操作见 [OPERATIONS.md](./OPERATIONS.md)。
 
 ## 2026-07-19 CDP execute_script 改造记录
 

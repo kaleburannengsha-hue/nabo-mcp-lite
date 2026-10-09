@@ -3,9 +3,10 @@
   "transport": "stdio",
   "command": "node",
   "args": [
-    "/absolute/path/to/nabo-mcp-lite/server/single-session-server.cjs"
+    "/absolute/path/to/nabo-mcp-lite/server/nabo-client.cjs"
   ],
   "env": {
-    "MCP_WS_PORT": "9876"
+    "MCP_WS_PORT": "9876",
+    "MCP_HUB_PORT": "9877"
   }
 }

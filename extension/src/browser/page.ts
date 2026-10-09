@@ -17,6 +17,7 @@ import {
   getScrollInfo as _getScrollInfo,
 } from './dom/service';
 import { DOMElementNode, type DOMState } from './dom/views';
+import { IdentityMismatchError, identityFromNode, identityMatches, type ElementIdentity } from './dom-cache';
 import { type BrowserContextConfig, DEFAULT_BROWSER_CONTEXT_CONFIG, type PageState, URLNotAllowedError } from './views';
 import { createLogger } from '../log';
 import { ClickableElementProcessor } from './dom/clickable/service';
@@ -66,6 +67,7 @@ export default class Page {
   private _state: PageState;
   private _validWebPage = false;
   private _cachedState: PageState | null = null;
+  private _lastStateError: string | null = null;
   private _cachedStateClickableElementsHashes: CachedStateClickableElementsHashes | null = null;
 
   constructor(tabId: number, url: string, title: string, config: Partial<BrowserContextConfig> = {}) {
@@ -430,15 +432,91 @@ export default class Page {
       this._state.scrollY = scrollY;
       this._state.visualViewportHeight = visualViewportHeight;
       this._state.scrollHeight = scrollHeight;
+      this._lastStateError = null;
       return this._state;
     } catch (error) {
       logger.error('Failed to update state:', error);
+      this._lastStateError = error instanceof Error ? error.message : String(error);
       // Return last known good state if available
       return this._state;
     }
   }
 
-  async takeScreenshot(fullPage = false): Promise<string | null> {
+  /** Message from the most recent failed scan, or null when the last scan succeeded. */
+  getLastStateError(): string | null {
+    return this._lastStateError;
+  }
+
+  /**
+   * Parse JPEG dimensions from the SOF marker without a full decode.
+   * Used so scale=1 screenshots don't pay for a decode just to learn the size.
+   */
+  private _parseJpegDimensions(base64: string): { width: number; height: number } | null {
+    try {
+      const binary = atob(base64);
+      let i = 2; // skip SOI
+      while (i + 9 < binary.length) {
+        if (binary.charCodeAt(i) !== 0xff) {
+          i++;
+          continue;
+        }
+        const marker = binary.charCodeAt(i + 1);
+        // SOF markers: C0-CF, excluding C4 (DHT), C8 (JPG), CC (DAC)
+        if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+          const height = (binary.charCodeAt(i + 5) << 8) | binary.charCodeAt(i + 6);
+          const width = (binary.charCodeAt(i + 7) << 8) | binary.charCodeAt(i + 8);
+          return { width, height };
+        }
+        const length = (binary.charCodeAt(i + 2) << 8) | binary.charCodeAt(i + 3);
+        i += 2 + length;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Take a screenshot with optional downscaling.
+   * scale < 1 re-encodes the capture to a smaller JPEG: a 2560px viewport
+   * capture is ~90k tokens raw, which is too expensive to consume routinely.
+   * Returns base64 plus pixel dimensions for coordinate mapping.
+   *
+   * Bounded by SCREENSHOT_TIMEOUT_MS: a wedged capture pipeline (observed once
+   * after a capture was interrupted while the window was occluded) otherwise
+   * hangs the call until the hub's 60s timeout, and every later capture on that
+   * tab hangs too. Failing fast lets the caller reload the tab and retry.
+   */
+  async takeScreenshotInfo(
+    fullPage = false,
+    scale = 1,
+    quality = 80,
+  ): Promise<{ data: string; width: number; height: number } | null> {
+    const SCREENSHOT_TIMEOUT_MS = 8000;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            new Error(
+              'Screenshot timed out after 8s — the tab is rendering no frames (likely occluded window or a stuck capture pipeline). Reload the tab (navigate/open_tab) and retry, or use get_dom/get_page_text instead.',
+            ),
+          ),
+        SCREENSHOT_TIMEOUT_MS,
+      );
+    });
+    try {
+      return await Promise.race([this._takeScreenshotInner(fullPage, scale, quality), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async _takeScreenshotInner(
+    fullPage: boolean,
+    scale: number,
+    quality: number,
+  ): Promise<{ data: string; width: number; height: number } | null> {
     if (!this._puppeteerPage) {
       throw new Error('Puppeteer page is not connected');
     }
@@ -476,11 +554,44 @@ export default class Page {
         }
       });
 
-      return screenshot as string;
+      if (!screenshot) return null;
+
+      const clampedScale = Math.min(Math.max(scale, 0.1), 1);
+      if (clampedScale >= 1) {
+        const dims = this._parseJpegDimensions(screenshot as string);
+        return { data: screenshot as string, width: dims?.width || 0, height: dims?.height || 0 };
+      }
+
+      // Downscale via canvas in the extension service worker
+      const blob = await (await fetch(`data:image/jpeg;base64,${screenshot}`)).blob();
+      const bitmap = await createImageBitmap(blob);
+      const width = Math.max(1, Math.round(bitmap.width * clampedScale));
+      const height = Math.max(1, Math.round(bitmap.height * clampedScale));
+      const canvas = new OffscreenCanvas(width, height);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        bitmap.close();
+        return { data: screenshot as string, width: bitmap.width, height: bitmap.height };
+      }
+      ctx.drawImage(bitmap, 0, 0, width, height);
+      bitmap.close();
+      const outBlob = await canvas.convertToBlob({ type: 'image/jpeg', quality: quality / 100 });
+      const bytes = new Uint8Array(await outBlob.arrayBuffer());
+      let binary = '';
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + chunk, bytes.length)));
+      }
+      return { data: btoa(binary), width, height };
     } catch (error) {
       logger.error('Failed to take screenshot:', error);
       throw error;
     }
+  }
+
+  async takeScreenshot(fullPage = false): Promise<string | null> {
+    const info = await this.takeScreenshotInfo(fullPage, 1, 80);
+    return info ? info.data : null;
   }
 
   url(): string {
@@ -509,7 +620,12 @@ export default class Page {
     }
 
     try {
-      await Promise.all([this.waitForPageAndFramesLoad(), this._puppeteerPage.goto(url)]);
+      // goto() already waits for the load event. The network-idle wait inside
+      // waitForPageAndFramesLoad costs up to 5s on pages that never go idle
+      // (search results, dashboards with polling) and buys nothing here — the
+      // next scan does its own wait before reading the DOM.
+      await this._puppeteerPage.goto(url);
+      await new Promise(resolve => setTimeout(resolve, this._config.minimumWaitPageLoadTime * 1000));
       logger.info('navigateTo complete');
     } catch (error) {
       if (error instanceof URLNotAllowedError) {
@@ -1098,7 +1214,12 @@ export default class Page {
     return null;
   }
 
-  async inputTextElementNode(useVision: boolean, elementNode: DOMElementNode, text: string): Promise<void> {
+  async inputTextElementNode(
+    useVision: boolean,
+    elementNode: DOMElementNode,
+    text: string,
+    verifyIdentity = false,
+  ): Promise<{ recovered: boolean }> {
     if (!this._puppeteerPage) {
       throw new Error('Puppeteer is not connected');
     }
@@ -1109,9 +1230,20 @@ export default class Page {
       //   await this._updateState(useVision, elementNode.highlightIndex);
       // }
 
-      const element = await this.locateElement(elementNode);
+      let element = await this.locateElement(elementNode);
+      let recovered = false;
+      if (!element && verifyIdentity) {
+        element = await this._locateByIdentity(elementNode);
+        recovered = element !== null;
+      }
       if (!element) {
-        throw new Error(`Element: ${elementNode} not found`);
+        throw new IdentityMismatchError(
+          `Cached element no longer exists on the page (${elementNode.tagName ?? '?'} "${(elementNode.getAllTextTillNextClickableElement() || '').trim().slice(0, 60)}") — the page changed since get_dom; run get_dom again for fresh indices.`,
+        );
+      }
+
+      if (verifyIdentity) {
+        await this._assertIdentity(element, elementNode, 'type into');
       }
 
       // Ensure element is ready for input
@@ -1183,8 +1315,10 @@ export default class Page {
 
       // Wait for page stability after input
       await this.waitForPageAndFramesLoad();
+      return { recovered };
     } catch (error) {
-      const errorMsg = `Failed to input text into element: ${elementNode}. Error: ${error instanceof Error ? error.message : String(error)}`;
+      if (error instanceof IdentityMismatchError) throw error;
+      const errorMsg = `Failed to input text into element ${elementNode.tagName ?? '?'} "${(elementNode.getAllTextTillNextClickableElement() || '').trim().slice(0, 40)}": ${error instanceof Error ? error.message : String(error)}`;
       logger.error(errorMsg);
       throw new Error(errorMsg);
     }
@@ -1282,7 +1416,84 @@ export default class Page {
     }
   }
 
-  async clickElementNode(useVision: boolean, elementNode: DOMElementNode): Promise<void> {
+  /**
+   * Find a live element matching a cached node's identity when its original
+   * selector no longer resolves — sites routinely swap components (Baidu
+   * replaces its search button when the AI chat box takes over), which would
+   * otherwise force a full re-scan for the same control.
+   *
+   * Only accepts an unambiguous match: two candidates with the same tag and
+   * text mean we cannot know which one the caller meant, so we return null and
+   * let the caller re-scan rather than guess.
+   */
+  private async _locateByIdentity(elementNode: DOMElementNode): Promise<ElementHandle | null> {
+    if (!this._puppeteerPage) return null;
+    const expected = identityFromNode(elementNode);
+    if (!expected.tag) return null;
+    const key = expected.text.replace(/\s+/g, '').toLowerCase().slice(0, 40);
+
+    const match = (await this._puppeteerPage.evaluate(
+      (tag, textKey) => {
+        const candidates = Array.from(document.querySelectorAll(tag));
+        const hits: number[] = [];
+        for (let i = 0; i < candidates.length; i++) {
+          const el = candidates[i] as HTMLElement;
+          const text = ((el.innerText ?? el.textContent) || '').replace(/\s+/g, '').toLowerCase();
+          if (!textKey || text.includes(textKey)) {
+            hits.push(i);
+            if (hits.length > 1) return { ambiguous: true, index: -1 };
+          }
+        }
+        return { ambiguous: false, index: hits.length === 1 ? hits[0] : -1 };
+      },
+      expected.tag,
+      key,
+    )) as { ambiguous: boolean; index: number };
+
+    if (match.ambiguous || match.index < 0) return null;
+
+    const handles = await this._puppeteerPage.$$(expected.tag);
+    const target = handles[match.index] ?? null;
+    for (let i = 0; i < handles.length; i++) {
+      if (i !== match.index) await handles[i].dispose();
+    }
+    if (target) logger.info('re-located element by identity:', expected.tag, key);
+    return target;
+  }
+
+  /**
+   * Refuse to act on an element that no longer matches what the scan recorded.
+   * Reusing a cached index is only safe while the element behind it is the same
+   * one the caller saw; when it differs, clicking would silently hit the wrong
+   * control, so we fail with an explicit mismatch instead.
+   */
+  private async _assertIdentity(element: ElementHandle, elementNode: DOMElementNode, action: string): Promise<void> {
+    const expected = identityFromNode(elementNode);
+    const actual = (await element.evaluate(el => ({
+      tag: el.tagName.toLowerCase(),
+      text: (((el as HTMLElement).innerText ?? el.textContent) || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+      id: (el as HTMLElement).id || '',
+      type: ((el as HTMLInputElement).type || '').toLowerCase(),
+      href: (el as HTMLAnchorElement).href || '',
+      isContentElement:
+        (el as HTMLElement).isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName),
+    }))) as ElementIdentity;
+
+    if (!identityMatches(expected, actual)) {
+      throw new IdentityMismatchError(
+        `Element identity mismatch — refusing to ${action} a possibly different element. ` +
+          `Scanned: <${expected.tag}${expected.id ? ` id=${expected.id}` : ''}> "${expected.text.slice(0, 60)}" | ` +
+          `Found: <${actual.tag}${actual.id ? ` id=${actual.id}` : ''}> "${actual.text.slice(0, 60)}". ` +
+          `The page changed since get_dom — run get_dom again for fresh indices.`,
+      );
+    }
+  }
+
+  async clickElementNode(
+    useVision: boolean,
+    elementNode: DOMElementNode,
+    verifyIdentity = false,
+  ): Promise<{ recovered: boolean }> {
     if (!this._puppeteerPage) {
       throw new Error('Puppeteer is not connected');
     }
@@ -1293,16 +1504,57 @@ export default class Page {
       //   await this._updateState(useVision, elementNode.highlightIndex);
       // }
 
-      const element = await this.locateElement(elementNode);
+      let element = await this.locateElement(elementNode);
+      let recovered = false;
+      if (!element && verifyIdentity) {
+        // The scanned node is gone (component swapped, list re-rendered).
+        // Re-locate the same control by identity before forcing a re-scan.
+        element = await this._locateByIdentity(elementNode);
+        recovered = element !== null;
+      }
       if (!element) {
-        throw new Error(`Element: ${elementNode} not found`);
+        throw new IdentityMismatchError(
+          `Cached element no longer exists on the page (${elementNode.tagName ?? '?'} "${(elementNode.getAllTextTillNextClickableElement() || '').trim().slice(0, 60)}") — the page changed since get_dom; run get_dom again for fresh indices.`,
+        );
+      }
+
+      if (verifyIdentity) {
+        await this._assertIdentity(element, elementNode, 'click');
       }
 
       // Scroll element into view if needed
       await this._scrollIntoViewIfNeeded(element);
 
+      // Fast path: click the element's centre with a real CDP mouse event.
+      // Puppeteer's element.click() first waits on an IntersectionObserver
+      // (threshold 1) to decide whether to scroll — a rendering-dependent
+      // callback that never fires when the window is occluded or the tab is
+      // throttled, so element.click() hangs until the timeout below and every
+      // click silently costs 2s. getBoundingClientRect has no such dependency.
+      // Only used for main-frame elements: inside an iframe the rect is
+      // relative to the frame, not the viewport.
+      const point = await element.evaluate(el => {
+        if (window.top !== window) return null;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) return null;
+        return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      }).catch(() => null);
+
+      if (point && this._puppeteerPage) {
+        try {
+          await Promise.race([
+            this._puppeteerPage.mouse.click(point.x, point.y),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Mouse click timeout')), 1000)),
+          ]);
+          await this._checkAndHandleNavigation();
+          return { recovered };
+        } catch (mouseError) {
+          logger.info('Coordinate click failed, falling back to element.click()', mouseError);
+        }
+      }
+
       try {
-        // First attempt: Use Puppeteer's click method with timeout
+        // Fallback: Use Puppeteer's click method with timeout
         await Promise.race([
           element.click(),
           new Promise((_, reject) => setTimeout(() => reject(new Error('Click timeout')), 2000)),
@@ -1327,11 +1579,33 @@ export default class Page {
           );
         }
       }
+      return { recovered };
     } catch (error) {
+      if (error instanceof IdentityMismatchError) throw error;
       throw new Error(
-        `Failed to click element: ${elementNode}. Error: ${error instanceof Error ? error.message : String(error)}`,
+        `Failed to click element ${elementNode.tagName ?? '?'} "${(elementNode.getAllTextTillNextClickableElement() || '').trim().slice(0, 40)}": ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  /**
+   * Attach local file(s) to a file input element via CDP DOM.setFileInputFiles.
+   * Paths are absolute paths on the machine running Chrome.
+   */
+  async uploadFileToElement(elementNode: DOMElementNode, paths: string[]): Promise<void> {
+    if (!this._puppeteerPage) {
+      throw new Error('Puppeteer is not connected');
+    }
+    const element = await this.locateElement(elementNode);
+    if (!element) {
+      throw new Error(`Element: ${elementNode} not found`);
+    }
+    const tag = await element.evaluate(el => el.tagName.toLowerCase());
+    const type = await element.evaluate(el => (el as HTMLInputElement).type?.toLowerCase());
+    if (tag !== 'input' || type !== 'file') {
+      throw new Error(`Element index is <${tag}${type ? ` type=${type}` : ''}>, not a file input`);
+    }
+    await (element as ElementHandle<HTMLInputElement>).uploadFile(...paths);
   }
 
   getSelectorMap(): Map<number, DOMElementNode> {
